@@ -10,11 +10,12 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Created by abhinav on 6/3/14.
  */
-public class Dispatcher {
+public class Dispatcher implements Runnable {
 
     // create the zookeeper master
     private Master master;
@@ -28,18 +29,37 @@ public class Dispatcher {
     // the routing strategy
     private IWorkerSelectionStrategy routeStrategy;
 
+    // initiate the map for triggers this is where we would store the job trigger related data
+    public static final ConcurrentHashMap<Long, JobTrigger> triggerMap = new ConcurrentHashMap<>();
+
     private Random rand = new Random(100);
 
     /**
-     * initialize the dispatcher
+     * create the dispatcher with zk master settings
+     *
+     * @param myId my unique id
+     * @param hostName zk server host name
      */
-    public void onInit() throws Exception {
+    public Dispatcher(String myId, String hostName) {
+        this.myId = myId;
+        this.hostName = hostName;
+
         routeStrategy = new MaxCapacitySelectionStrategy();
-        master = new Master(myId, hostName, new ExponentialBackoffRetry(1000, 5));
+        master = new Master(this.myId, this.hostName, new ExponentialBackoffRetry(1000, 5));
         // start the master client
         master.startZk();
         // now create the groups in it executors and fired_triggers
-        master.bootstrap();
+        try {
+            master.bootstrap();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * initialize the dispatcher zk leader election process
+     */
+    public void startZK() throws Exception {
         // start the master leader election process
         master.doRun();
     }
@@ -47,17 +67,19 @@ public class Dispatcher {
     /**
      * start the polling process in here, fetch the triggers then on basis of the Load Balancing algorithm assign it to specific server
      */
-    public void start() {
+    @Override
+    public void run() {
         while (true) {
             try {
                 Thread.sleep(2000);
                 List<JobTrigger> triggers = getTriggers();
                 for (JobTrigger trigger : triggers) {
                     // assign to the worker selected by the strategy
+                    triggerMap.put(trigger.getId(), trigger);
                     master.assignToSelectedWorker(trigger, routeStrategy);
                 }
             } catch (InterruptedException e) {
-                e.printStackTrace();
+                throw new RuntimeException(e);
             }
         }
     }

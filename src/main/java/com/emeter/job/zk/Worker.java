@@ -1,5 +1,6 @@
 package com.emeter.job.zk;
 
+import com.emeter.job.Dispatcher;
 import com.emeter.job.Executor;
 import com.emeter.job.data.JobExecution;
 import com.emeter.job.data.JobTrigger;
@@ -9,7 +10,7 @@ import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.recipes.cache.*;
 import org.apache.curator.retry.ExponentialBackoffRetry;
-import org.apache.zookeeper.*;
+import org.apache.zookeeper.CreateMode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -63,10 +64,17 @@ public class Worker implements Closeable, Runnable {
             switch (pathChildrenCacheEvent.getType()) {
                 case CHILD_ADDED:
                     // task was assigned to me with job trigger id as its data
-                    Long jobTriggerId = Long.valueOf(BytesUtil.toString(pathChildrenCacheEvent.getData().getData()));
-                    LOG.info("Job trigger assigned to me id - " + jobTriggerId);
-                    // process the job
-                    processJobTrigger(jobTriggerId);
+                    final Long jobTriggerId = Long.valueOf(BytesUtil.toString(pathChildrenCacheEvent.getData().getData()));
+                    if (blockingQueue.remainingCapacity() == 0) {
+                        deleteAssignment(jobTriggerId);
+                        deleteFiredTrigger(jobTriggerId, jobTriggerId % 10);
+                        Dispatcher.triggerMap.remove(jobTriggerId);
+                    } else {
+                        LOG.info("Job trigger assigned to me id - " + jobTriggerId);
+                        // process the job
+                        processJobTrigger(jobTriggerId);
+                    }
+
                     break;
                 default:
                     break;
@@ -107,10 +115,9 @@ public class Worker implements Closeable, Runnable {
         this.client = CuratorFrameworkFactory.newClient(hostPort, retryPolicy);
 
         this.myPath = Master.EXECUTOR_PATH + "/" + workerId;
-        this.myAssignPath = Master.FIRED_TRIGGERS_PATH + "/" + workerId;
 
         // initiate the assign cache and listen on this for assignments to this worker
-        this.assignCache = new PathChildrenCache(client, Master.ASSIGN_PATH, true);
+        this.assignCache = new PathChildrenCache(client, Master.EXECUTOR_PATH, true);
         // this is the worker cache, initiate it and listen on it for any changes
         this.myCache = new NodeCache(client, myPath, true);
 
@@ -131,8 +138,6 @@ public class Worker implements Closeable, Runnable {
             // create the two nodes in here
             // one which show up the capacity of the worker or we can add some config to it
             client.create().withMode(CreateMode.EPHEMERAL).forPath(myPath, new byte[0]);
-            // this one would show which trigger was assigned to it from the dispatcher.
-            client.create().withMode(CreateMode.EPHEMERAL).forPath(myAssignPath, new byte[0]);
         } catch (Exception e) {
             LOG.error("Error while creating worker node path [" + myPath + "] - " + e);
         }
@@ -232,7 +237,8 @@ public class Worker implements Closeable, Runnable {
             // Step 2 - delete the job trigger id from the worker assignment path
             deleteAssignment(jobTriggerId);
             // Step 3 - delete the fired trigger entry for the job trigger and job def id
-            deleteFiredTrigger(completedJobExecution.getJobTriggerId(), completedJobExecution.getJobDefId());
+            deleteFiredTrigger(jobTriggerId, completedJobExecution.getJobDefId());
+            Dispatcher.triggerMap.remove(jobTriggerId);
         } catch (InterruptedException e) {
             e.printStackTrace();
         } catch (ExecutionException e) {

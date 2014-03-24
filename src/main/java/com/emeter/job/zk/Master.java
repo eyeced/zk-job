@@ -37,7 +37,6 @@ public class Master implements Closeable, LeaderSelectorListener {
     public static final String DISPATCHER_PATH = "/dispatchers";
     public static final String EXECUTOR_PATH = "/executors";
     public static final String FIRED_TRIGGERS_PATH = "/firedTriggers";
-    public static final String ASSIGN_PATH = "/assign";
 
     private CountDownLatch leaderLatch = new CountDownLatch(1);
     private CountDownLatch closeLatch = new CountDownLatch(1);
@@ -49,8 +48,6 @@ public class Master implements Closeable, LeaderSelectorListener {
 
     /** the executors path children cache, this is from where it will access the registered executors */
     private final PathChildrenCache executorCache;
-
-    private final PathChildrenCache assignmentCache;
 
     /** executor cache listener with types of events published. */
     PathChildrenCacheListener executorsCacheListener = new PathChildrenCacheListener() {
@@ -89,7 +86,6 @@ public class Master implements Closeable, LeaderSelectorListener {
 
         this.leaderSelector = new LeaderSelector(this.client, DISPATCHER_PATH, this);
         this.executorCache = new PathChildrenCache(this.client, EXECUTOR_PATH, true);
-        this.assignmentCache = new PathChildrenCache(this.client, ASSIGN_PATH, true);
     }
 
     /**
@@ -127,7 +123,7 @@ public class Master implements Closeable, LeaderSelectorListener {
         client.create().forPath(EXECUTOR_PATH, new byte[0]);
         // initiate the assignment group, here every worker would make an entry on it's name
         // now whenever a job trigger is assigned to that worker, a node would be created under the worker's group
-        client.create().forPath(ASSIGN_PATH, new byte[0]);
+
         // in fired triggers, when executor gets a job then it will create a fired trigger znode in the
         // group with a unique_identity of {trigger_id}_{job_def_id} and in it we will set the data in it
         client.create().forPath(FIRED_TRIGGERS_PATH, new byte[0]);
@@ -219,7 +215,7 @@ public class Master implements Closeable, LeaderSelectorListener {
             } catch (UnsupportedEncodingException e) {
                 LOG.error("Error while parsing node data" + e);
             } catch (Exception e) {
-                LOG.warn("Unable to create node with path - " + ASSIGN_PATH + "/" + workerId + "/" + jobTrigger.getId());
+                LOG.warn("Unable to create node with path - " + EXECUTOR_PATH + "/" + workerId + "/" + jobTrigger.getId());
             }
         }
     }
@@ -233,7 +229,7 @@ public class Master implements Closeable, LeaderSelectorListener {
      */
     private void assignToWorker(String workerId, JobTrigger jobTrigger) throws Exception {
         client.create().withMode(CreateMode.EPHEMERAL).inBackground().
-                forPath(ASSIGN_PATH + "/" + workerId + "/" + jobTrigger.getId(), BytesUtil.toBytes(jobTrigger.getId().intValue()));
+                forPath(EXECUTOR_PATH + "/" + workerId + "/" + jobTrigger.getId(), BytesUtil.toBytes(jobTrigger.getId().intValue()));
     }
 
     /**
