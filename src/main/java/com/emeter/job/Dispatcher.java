@@ -5,6 +5,8 @@ import com.emeter.job.route.IWorkerSelectionStrategy;
 import com.emeter.job.route.MaxCapacitySelectionStrategy;
 import com.emeter.job.zk.Master;
 import org.apache.curator.retry.ExponentialBackoffRetry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Date;
@@ -16,6 +18,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * Created by abhinav on 6/3/14.
  */
 public class Dispatcher implements Runnable {
+
+    /** The Logger */
+    private static final Logger LOG = LoggerFactory.getLogger(Dispatcher.class);
 
     // create the zookeeper master
     private Master master;
@@ -73,11 +78,8 @@ public class Dispatcher implements Runnable {
             try {
                 Thread.sleep(2000);
                 List<JobTrigger> triggers = getTriggers();
-                for (JobTrigger trigger : triggers) {
-                    // assign to the worker selected by the strategy
-                    triggerMap.put(trigger.getId(), trigger);
-                    master.assignToSelectedWorker(trigger, routeStrategy);
-                }
+                master.assignTriggers(triggers, routeStrategy);
+                // Thread.sleep(20000);
             } catch (InterruptedException e) {
                 throw new RuntimeException(e);
             }
@@ -91,9 +93,9 @@ public class Dispatcher implements Runnable {
      */
     private List<JobTrigger> getTriggers() {
         List<JobTrigger> triggers = new ArrayList<>(10);
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 40; i++) {
             JobTrigger trigger = new JobTrigger();
-            Long id = new Long(rand.nextInt());
+            Long id = new Long(rand.nextInt(100));
             trigger.setId(id);
             trigger.setJobDefId(id % 10 + 1);
             trigger.setNextFireTime(new Date());

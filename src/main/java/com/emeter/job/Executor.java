@@ -31,9 +31,10 @@ public class Executor {
      * @return
      */
     public JobExecution execute(JobTrigger jobTrigger) {
+        // LOGGER.info("----------------------- Job is executing [" + jobTrigger.getId() + "]---------------------");
         // get a random number of wait milli seconds for which this job would take time to execute
         // this is just to reciprocate the production environment
-        int waitMillis = random.nextInt(500);
+        int waitMillis = random.nextInt(1000);
         JobExecution jobExecution = new JobExecution();
         jobExecution.setStartTime(new Date());
         jobExecution.setTriggerFireTime(jobTrigger.getNextFireTime());
@@ -46,6 +47,7 @@ public class Executor {
         jobExecution.setJobTriggerId(jobTrigger.getId());
         jobExecution.setJobDefId(jobTrigger.getJobDefId());
         jobExecution.setEndTime(new Date());
+        LOGGER.info("----------------------- Job is completed waited for " + waitMillis + " for trigger id [" + jobTrigger.getId() + "] ---------------------");
         return jobExecution;
     }
 }

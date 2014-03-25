@@ -1,7 +1,9 @@
 package com.emeter.job.zk;
 
+import com.emeter.job.Dispatcher;
 import com.emeter.job.data.JobTrigger;
 import com.emeter.job.route.IWorkerSelectionStrategy;
+import com.emeter.job.sample.CustomCompressionProvider;
 import com.emeter.job.util.BytesUtil;
 import org.apache.curator.RetryPolicy;
 import org.apache.curator.framework.CuratorFramework;
@@ -38,6 +40,9 @@ public class Master implements Closeable, LeaderSelectorListener {
     public static final String EXECUTOR_PATH = "/executors";
     public static final String FIRED_TRIGGERS_PATH = "/firedTriggers";
 
+    public static final int DEFAULT_SESSION_TIMEOUT_MS = Integer.getInteger("curator-default-session-timeout", 60 * 1000);
+    public static final int DEFAULT_CONNECTION_TIMEOUT_MS = Integer.getInteger("curator-default-connection-timeout", 15 * 1000);
+
     private CountDownLatch leaderLatch = new CountDownLatch(1);
     private CountDownLatch closeLatch = new CountDownLatch(1);
 
@@ -57,16 +62,16 @@ public class Master implements Closeable, LeaderSelectorListener {
                     LOG.info("Executor child was added");
                     break;
                 case CHILD_UPDATED:
-                    LOG.info("Executor child data was ");
+                    // LOG.info("Executor child data was updated");
                     break;
                 case CHILD_REMOVED:
-                    LOG.info("Executor child was removed");
+                    // LOG.info("Executor child was removed");
                     break;
                 case CONNECTION_RECONNECTED:
-                    LOG.info("Executor child reconnected");
+                    // LOG.info("Executor child reconnected");
                     break;
                 case INITIALIZED:
-                    LOG.info("Executor child was initialized");
+                    // LOG.info("Executor child was initialized");
                     break;
             }
         }
@@ -82,7 +87,13 @@ public class Master implements Closeable, LeaderSelectorListener {
     public Master(String myId, String hostPort, RetryPolicy retryPolicy) {
         LOG.info(myId + ": " + hostPort );
         this.myId = myId;
-        this.client = CuratorFrameworkFactory.newClient(hostPort, retryPolicy);
+        this.client = CuratorFrameworkFactory.builder().
+                compressionProvider(new CustomCompressionProvider()).
+                connectString(hostPort).
+                sessionTimeoutMs(DEFAULT_SESSION_TIMEOUT_MS).
+                connectionTimeoutMs(DEFAULT_CONNECTION_TIMEOUT_MS).
+                retryPolicy(retryPolicy).
+                build();
 
         this.leaderSelector = new LeaderSelector(this.client, DISPATCHER_PATH, this);
         this.executorCache = new PathChildrenCache(this.client, EXECUTOR_PATH, true);
@@ -183,12 +194,15 @@ public class Master implements Closeable, LeaderSelectorListener {
      * @param selectionStrategy the worker selection strategy
      */
     public void assignToSelectedWorker(final JobTrigger jobTrigger, IWorkerSelectionStrategy selectionStrategy) {
+        // LOG.info("Master - got job trigger - " + jobTrigger.getId());
         // get the worker Id for the selected worker
         final ChildData selectedWorker = selectionStrategy.select(getWorkers());
+
         final String firedTriggerPath = FIRED_TRIGGERS_PATH + "/" + jobTrigger.getId() + "_" + jobTrigger.getJobDefId();
         if (selectedWorker != null) {
+            // LOG.info("Selected worker - " + selectedWorker.getPath());
             final String selectedWorkerPath = selectedWorker.getPath();
-            final String workerId = selectedWorkerPath.replace("/workers/", "");
+            final String workerId = selectedWorkerPath.replace(EXECUTOR_PATH + "/", "");
             try {
                 final int currentCapacity = BytesUtil.toInt(selectedWorker.getData());
                 // take a lock on the trigger by creating a node in fired trigger path
@@ -197,19 +211,123 @@ public class Master implements Closeable, LeaderSelectorListener {
                     public void processResult(CuratorFramework curatorFramework, CuratorEvent curatorEvent) throws Exception {
                         switch (curatorEvent.getType()) {
                             case SET_DATA:
+                                LOG.info("set data event fired");
+                                break;
+                            case CREATE:
+                                // LOG.info("Child created");
                                 if (curatorEvent.getResultCode() == KeeperException.Code.OK.intValue()) {
                                     // lock is being taken now assign it to the worker
                                     assignToWorker(workerId, jobTrigger);
                                     // decrement the capacity of the worker
                                     decrementCounter(selectedWorkerPath, currentCapacity);                             }
                                 break;
-
                             default:
                                 break;
                         }
 
                     }
                 }).forPath(firedTriggerPath, new byte[0]);
+            } catch (KeeperException.NodeExistsException e) {
+                LOG.warn("trigger already assigned");
+            } catch (UnsupportedEncodingException e) {
+                LOG.error("Error while parsing node data" + e);
+            } catch (Exception e) {
+                LOG.warn("Unable to create node with path - " + EXECUTOR_PATH + "/" + workerId + "/" + jobTrigger.getId());
+            }
+        }
+    }
+
+    /**
+     * start the process of assigning triggers
+     *
+     * @param triggers list of triggers
+     * @param selectionStrategy selection strategy passed on
+     */
+    public void assignTriggers(final List<JobTrigger> triggers, final IWorkerSelectionStrategy selectionStrategy) {
+        assignTriggersToWorkers(triggers, selectionStrategy, 0);
+    }
+
+    /**
+     * Recursively assign triggers to the selected workers.
+     *
+     * There is some dynamic nature to this call, as we are assigning triggers the strategy would change the worker, because as the task would be assigned
+     * it will change it's capacity, so the initial call which would start the recursive process would start with index 0
+     *
+     * the logic in here goes like this -
+     * - Take lock on fired trigger entry and attach a callback onto it
+     * - fired trigger created, callback would now assign a task for the selected worker with callback
+     * - as soon as the trigger is assigned then add a callback to decrement capacity for that worker
+     * - as soon we decrement counter recursively callback to the function with increased index
+     *
+     * @param triggers list of triggers
+     * @param selectionStrategy selection strategy passed on
+     * @param index at which index we are from where we would need to get the triggers
+     */
+    private void assignTriggersToWorkers(final List<JobTrigger> triggers, final IWorkerSelectionStrategy selectionStrategy, final int index) {
+        // recursion exit check
+        if (triggers.size() == index) {
+            return;
+        }
+        final JobTrigger jobTrigger = triggers.get(index);
+        // assign to the worker selected by the strategy
+        Dispatcher.triggerMap.put(jobTrigger.getId(), jobTrigger);
+        final ChildData selectedWorker = selectionStrategy.select(getWorkers());
+        final String firedTriggerPath = FIRED_TRIGGERS_PATH + "/" + jobTrigger.getId() + "_" + jobTrigger.getJobDefId();
+
+        if (selectedWorker != null) {
+            // LOG.info("Selected worker - " + selectedWorker.getPath());
+            final String selectedWorkerPath = selectedWorker.getPath();
+            final String workerId = selectedWorkerPath.replace(EXECUTOR_PATH + "/", "");
+
+            try {
+                final int currentCapacity = BytesUtil.toInt(selectedWorker.getData());
+                LOG.info("Master - capacity -" + currentCapacity);
+                // call back for decrement counter, when complete then call on the parent function of assigning triggers
+                final BackgroundCallback decrementCounterCallback = new BackgroundCallback() {
+                    @Override
+                    public void processResult(CuratorFramework curatorFramework, CuratorEvent curatorEvent) throws Exception {
+                        switch (curatorEvent.getType()) {
+                            // it depends on completion of assign task callback to be completed
+                            case SET_DATA:
+                                assignTriggersToWorkers(triggers, selectionStrategy, index + 1);
+                                break;
+                            default:
+                                LOG.info("Event not handled 0 - " + curatorEvent.getType().name());
+                                break;
+                        }
+                    }
+                };
+
+                // assign task callback, called when the user is able to create the fired trigger for the given trigger
+                final BackgroundCallback assignTaskCallback = new BackgroundCallback() {
+                    @Override
+                    public void processResult(CuratorFramework curatorFramework, CuratorEvent curatorEvent) throws Exception {
+                        switch (curatorEvent.getType()) {
+                            case CREATE:
+                                client.setData().inBackground(decrementCounterCallback).forPath(selectedWorkerPath, BytesUtil.toBytes(currentCapacity - 1));
+                                break;
+                            default:
+                                LOG.info("Event not handled 1 - " + curatorEvent.getType().name());
+                                break;
+                        }
+                    }
+                };
+
+                // create the fired trigger entry and add this callback which calls on the subsequent task that is to assign the trigger to the selected worker
+                final BackgroundCallback firedTriggerCreatedCallback = new BackgroundCallback() {
+                    @Override
+                    public void processResult(CuratorFramework curatorFramework, CuratorEvent curatorEvent) throws Exception {
+                        switch (curatorEvent.getType()) {
+                            case CREATE:
+                                // LOG.info("Creating assignment node at " + EXECUTOR_PATH + "/" + workerId + "/" + jobTrigger.getId());
+                                client.create().withMode(CreateMode.EPHEMERAL).inBackground(assignTaskCallback).
+                                        forPath(EXECUTOR_PATH + "/" + workerId + "/" + jobTrigger.getId(), BytesUtil.toBytes(jobTrigger.getId().intValue()));
+                                break;
+                        }
+                    }
+                };
+                // take a lock on the trigger by creating a node in fired trigger path
+                client.create().withMode(CreateMode.EPHEMERAL).inBackground(firedTriggerCreatedCallback).forPath(firedTriggerPath, new byte[0]);
             } catch (KeeperException.NodeExistsException e) {
                 LOG.warn("trigger already assigned");
             } catch (UnsupportedEncodingException e) {
@@ -228,6 +346,7 @@ public class Master implements Closeable, LeaderSelectorListener {
      * @throws Exception
      */
     private void assignToWorker(String workerId, JobTrigger jobTrigger) throws Exception {
+        // LOG.info("!!!!!!!!!! creating node with path " + EXECUTOR_PATH + "/" + workerId + "/" + jobTrigger.getId() + "!!!!!!!!!!!!!!!");
         client.create().withMode(CreateMode.EPHEMERAL).inBackground().
                 forPath(EXECUTOR_PATH + "/" + workerId + "/" + jobTrigger.getId(), BytesUtil.toBytes(jobTrigger.getId().intValue()));
     }

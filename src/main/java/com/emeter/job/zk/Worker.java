@@ -4,10 +4,13 @@ import com.emeter.job.Dispatcher;
 import com.emeter.job.Executor;
 import com.emeter.job.data.JobExecution;
 import com.emeter.job.data.JobTrigger;
+import com.emeter.job.sample.CustomCompressionProvider;
 import com.emeter.job.util.BytesUtil;
 import org.apache.curator.RetryPolicy;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.framework.api.BackgroundCallback;
+import org.apache.curator.framework.api.CuratorEvent;
 import org.apache.curator.framework.recipes.cache.*;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.zookeeper.CreateMode;
@@ -16,8 +19,10 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.UnsupportedEncodingException;
 import java.util.Random;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The Class Worker
@@ -39,14 +44,8 @@ public class Worker implements Closeable, Runnable {
     /** my complete path in zookeeper server. */
     private String myPath;
 
-    /** I will listen for the assignments on this node path. */
-    private String myAssignPath;
-
     /** the count down latch for closing the worker, await for it until the close is called upon by the close method.*/
     private final CountDownLatch closeLatch = new CountDownLatch(1);
-
-    private volatile boolean connected = false;
-    private volatile boolean expired = false;
 
     /** assign tasks path cache, to keep a tab on the triggers assigned to me. */
     private PathChildrenCache assignCache;
@@ -57,6 +56,8 @@ public class Worker implements Closeable, Runnable {
     /** the god curator framework client. */
     private final CuratorFramework client;
 
+    private final AtomicInteger count = new AtomicInteger(10);
+
     /** listener which listens on the different events fired */
     private PathChildrenCacheListener assignCacheListener = new PathChildrenCacheListener() {
         @Override
@@ -64,19 +65,28 @@ public class Worker implements Closeable, Runnable {
             switch (pathChildrenCacheEvent.getType()) {
                 case CHILD_ADDED:
                     // task was assigned to me with job trigger id as its data
+                    // LOG.info("Worker - Child added for assignment");
                     final Long jobTriggerId = Long.valueOf(BytesUtil.toString(pathChildrenCacheEvent.getData().getData()));
-                    if (blockingQueue.remainingCapacity() == 0) {
+                    if (count.intValue() == 0) {
                         deleteAssignment(jobTriggerId);
                         deleteFiredTrigger(jobTriggerId, jobTriggerId % 10);
                         Dispatcher.triggerMap.remove(jobTriggerId);
                     } else {
-                        LOG.info("Job trigger assigned to me id - " + jobTriggerId);
+                        // LOG.info("%%%%%%%%%%%%%%%%%%%%%%% Job trigger assigned to me id - " + jobTriggerId);
                         // process the job
                         processJobTrigger(jobTriggerId);
+                        count.set(count.intValue() + 1);
                     }
 
                     break;
+                case CHILD_UPDATED:
+                    LOG.info("Child updated");
+                    break;
+                case INITIALIZED:
+                    LOG.info("initialized");
+                    break;
                 default:
+                    LOG.info("Event was fired but not caught - " + pathChildrenCacheEvent.getType().name());
                     break;
             }
         }
@@ -86,7 +96,7 @@ public class Worker implements Closeable, Runnable {
     private NodeCacheListener myCacheListener = new NodeCacheListener() {
         @Override
         public void nodeChanged() throws Exception {
-            LOG.info("Node changed");
+            // LOG.info("Node changed --- capacity - " + BytesUtil.toString(myCache.getCurrentData().getData()));
         }
     };
 
@@ -111,17 +121,23 @@ public class Worker implements Closeable, Runnable {
      *
      * @param hostPort
      */
-    public Worker(String hostPort, RetryPolicy retryPolicy) {
-        this.client = CuratorFrameworkFactory.newClient(hostPort, retryPolicy);
+    public Worker(String hostPort) {
+        this.client = CuratorFrameworkFactory.builder().
+                compressionProvider(new CustomCompressionProvider()).
+                connectString(hostPort).
+                sessionTimeoutMs(Master.DEFAULT_SESSION_TIMEOUT_MS).
+                connectionTimeoutMs(Master.DEFAULT_CONNECTION_TIMEOUT_MS).
+                retryPolicy(new ExponentialBackoffRetry(1000, 5)).
+                build();
 
         this.myPath = Master.EXECUTOR_PATH + "/" + workerId;
 
         // initiate the assign cache and listen on this for assignments to this worker
-        this.assignCache = new PathChildrenCache(client, Master.EXECUTOR_PATH, true);
+        this.assignCache = new PathChildrenCache(client, this.myPath, true);
         // this is the worker cache, initiate it and listen on it for any changes
         this.myCache = new NodeCache(client, myPath, true);
 
-        this.blockingQueue = new ArrayBlockingQueue<>(200);
+        this.blockingQueue = new ArrayBlockingQueue<>(10);
         this.executor = new ThreadPoolExecutor(1, 1,
                 1000L,
                 TimeUnit.MILLISECONDS,
@@ -137,7 +153,22 @@ public class Worker implements Closeable, Runnable {
         try {
             // create the two nodes in here
             // one which show up the capacity of the worker or we can add some config to it
-            client.create().withMode(CreateMode.EPHEMERAL).forPath(myPath, new byte[0]);
+            client.create().withMode(CreateMode.PERSISTENT).inBackground(new BackgroundCallback() {
+                @Override
+                public void processResult(CuratorFramework curatorFramework, CuratorEvent curatorEvent) throws Exception {
+                    switch (curatorEvent.getType()) {
+                        case CREATE:
+                            LOG.info("Worker node is created for path - " + curatorEvent.getPath());
+                            assignCache.getListenable().addListener(assignCacheListener);
+                            assignCache.start();
+                            break;
+                        default:
+                            LOG.info("default case called for event - " + curatorEvent.getType().name());
+                            break;
+
+                    }
+                }
+            }).forPath(myPath, BytesUtil.toBytes(blockingQueue.remainingCapacity()));
         } catch (Exception e) {
             LOG.error("Error while creating worker node path [" + myPath + "] - " + e);
         }
@@ -155,8 +186,9 @@ public class Worker implements Closeable, Runnable {
     @Override
     public void run() {
         try {
+            myCache.getListenable().addListener(myCacheListener);
             myCache.start();
-            assignCache.start();
+
             closeLatch.await();
         } catch (InterruptedException e) {
             LOG.warn("Worker thread was interrupted " + e);
@@ -185,8 +217,9 @@ public class Worker implements Closeable, Runnable {
      * @param jobDefId the job definition id
      */
     public void deleteFiredTrigger(final Long jobTriggerId, final Long jobDefId) {
-        final String firedTriggerNodePath = Master.FIRED_TRIGGERS_PATH + "/" + jobTriggerId + "/" + jobDefId;
+        final String firedTriggerNodePath = Master.FIRED_TRIGGERS_PATH + "/" + jobTriggerId + "_" + jobDefId;
         try {
+            // LOG.info("####### Deleting fired trigger for path - " + firedTriggerNodePath);
             client.delete().inBackground().forPath(firedTriggerNodePath);
         } catch (Exception e) {
             LOG.error("Exception came while deleting the fired trigger entry[" + firedTriggerNodePath + "] error -" + e);
@@ -199,16 +232,7 @@ public class Worker implements Closeable, Runnable {
      * @return boolean
      */
     public boolean isConnected() {
-        return connected;
-    }
-
-    /**
-     * Checks if ZooKeeper session is expired.
-     *
-     * @return boolean value
-     */
-    public boolean isExpired() {
-        return expired;
+        return client.getZookeeperClient().isConnected();
     }
 
     @Override
@@ -230,19 +254,20 @@ public class Worker implements Closeable, Runnable {
         Future<JobExecution> future = submitJob(jobTriggerId);
         try {
             // got the completed or failed job execution.
-            JobExecution completedJobExecution = future.get();
+            future.get();
+            LOG.info("Worker " + myPath + " - capacity - " + (10 - executor.getActiveCount()));
+            updateCapacity(10 - assignCache.getCurrentData().size());
 
-            // Step 1 - update the capacity of self
-            updateCapacity(blockingQueue.remainingCapacity());
-            // Step 2 - delete the job trigger id from the worker assignment path
-            deleteAssignment(jobTriggerId);
-            // Step 3 - delete the fired trigger entry for the job trigger and job def id
-            deleteFiredTrigger(jobTriggerId, completedJobExecution.getJobDefId());
-            Dispatcher.triggerMap.remove(jobTriggerId);
         } catch (InterruptedException e) {
             e.printStackTrace();
         } catch (ExecutionException e) {
-            e.printStackTrace();
+            LOG.error(e.toString());
+        } finally {
+            // Step 2 - delete the job trigger id from the worker assignment path
+            deleteAssignment(jobTriggerId);
+            // Step 3 - delete the fired trigger entry for the job trigger and job def id
+            deleteFiredTrigger(jobTriggerId, jobTriggerId % 10);
+            Dispatcher.triggerMap.remove(jobTriggerId);
         }
     }
 
@@ -253,9 +278,9 @@ public class Worker implements Closeable, Runnable {
      */
     private void deleteAssignment(Long jobTriggerId) {
         try {
-            client.delete().inBackground().forPath(myAssignPath + "/" + jobTriggerId);
+            client.delete().inBackground().forPath(myPath + "/" + jobTriggerId);
         } catch (Exception e) {
-            LOG.error("Exception while deleting the node [" + myAssignPath + "/" + jobTriggerId + "]");
+            LOG.error("Exception while deleting the node [" + myPath + "/" + jobTriggerId + "]");
         }
     }
 
@@ -269,8 +294,7 @@ public class Worker implements Closeable, Runnable {
             JobTrigger trigger;
 
             public Callable<JobExecution> init(Long triggerId) {
-                this.trigger = new JobTrigger();
-                this.trigger.setId(triggerId);
+                this.trigger = Dispatcher.triggerMap.get(triggerId);
                 return this;
             }
             @Override
@@ -287,19 +311,6 @@ public class Worker implements Closeable, Runnable {
      * @throws Exception
      */
     public static void main(String args[]) throws Exception {
-        Worker w = new Worker(args[0], new ExponentialBackoffRetry(1000, 5));
-        w.startZK();
 
-        while(!w.isConnected()){
-            Thread.sleep(100);
-        }
-
-        /*
-         * Registers this worker so that the leader knows that
-         * it is here.
-         */
-        while(!w.isExpired()){
-            Thread.sleep(1000);
-        }
     }
 }
