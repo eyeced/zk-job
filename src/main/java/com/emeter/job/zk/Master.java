@@ -1,6 +1,7 @@
 package com.emeter.job.zk;
 
 import com.emeter.job.Dispatcher;
+import com.emeter.job.common.MySharedCount;
 import com.emeter.job.data.JobTrigger;
 import com.emeter.job.route.IWorkerSelectionStrategy;
 import com.emeter.job.sample.CustomCompressionProvider;
@@ -26,7 +27,9 @@ import org.slf4j.LoggerFactory;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 
 /**
@@ -51,6 +54,9 @@ public class Master implements Closeable, LeaderSelectorListener {
 
     private String myId;
 
+    /** shared counter of the executors with worker path as the key to the shared counter. */
+    private final Map<String, MySharedCount> executorCounters = new HashMap<>();
+
     /** the executors path children cache, this is from where it will access the registered executors */
     private final PathChildrenCache executorCache;
 
@@ -60,12 +66,18 @@ public class Master implements Closeable, LeaderSelectorListener {
             switch (event.getType()) {
                 case CHILD_ADDED:
                     LOG.info("Executor child was added");
+                    initCounterForWorker(event.getData().getPath());
                     break;
                 case CHILD_UPDATED:
                     // LOG.info("Executor child data was updated");
                     break;
                 case CHILD_REMOVED:
                     // LOG.info("Executor child was removed");
+                    try {
+                        executorCounters.get(event.getData().getPath()) .close();
+                    } catch (IOException e) {
+                        LOG.error(e.toString(), e);
+                    }
                     break;
                 case CONNECTION_RECONNECTED:
                     // LOG.info("Executor child reconnected");
@@ -150,6 +162,9 @@ public class Master implements Closeable, LeaderSelectorListener {
     @Override
     public void close() throws IOException {
         closeLatch.countDown();
+        for (String path : executorCounters.keySet()) {
+            executorCounters.get(path).close();
+        }
         client.close();
         leaderSelector.close();
     }
@@ -184,56 +199,6 @@ public class Master implements Closeable, LeaderSelectorListener {
                     LOG.warn("Exception while closing - " + e);
                 }
                 break;
-        }
-    }
-
-    /**
-     * select a worker from the provided routing strategy and assign the trigger to this worker
-     *
-     * @param jobTrigger the trigger
-     * @param selectionStrategy the worker selection strategy
-     */
-    public void assignToSelectedWorker(final JobTrigger jobTrigger, IWorkerSelectionStrategy selectionStrategy) {
-        // LOG.info("Master - got job trigger - " + jobTrigger.getId());
-        // get the worker Id for the selected worker
-        final ChildData selectedWorker = selectionStrategy.select(getWorkers());
-
-        final String firedTriggerPath = FIRED_TRIGGERS_PATH + "/" + jobTrigger.getId() + "_" + jobTrigger.getJobDefId();
-        if (selectedWorker != null) {
-            // LOG.info("Selected worker - " + selectedWorker.getPath());
-            final String selectedWorkerPath = selectedWorker.getPath();
-            final String workerId = selectedWorkerPath.replace(EXECUTOR_PATH + "/", "");
-            try {
-                final int currentCapacity = BytesUtil.toInt(selectedWorker.getData());
-                // take a lock on the trigger by creating a node in fired trigger path
-                client.create().withMode(CreateMode.EPHEMERAL).inBackground(new BackgroundCallback() {
-                    @Override
-                    public void processResult(CuratorFramework curatorFramework, CuratorEvent curatorEvent) throws Exception {
-                        switch (curatorEvent.getType()) {
-                            case SET_DATA:
-                                LOG.info("set data event fired");
-                                break;
-                            case CREATE:
-                                // LOG.info("Child created");
-                                if (curatorEvent.getResultCode() == KeeperException.Code.OK.intValue()) {
-                                    // lock is being taken now assign it to the worker
-                                    assignToWorker(workerId, jobTrigger);
-                                    // decrement the capacity of the worker
-                                    decrementCounter(selectedWorkerPath, currentCapacity);                             }
-                                break;
-                            default:
-                                break;
-                        }
-
-                    }
-                }).forPath(firedTriggerPath, new byte[0]);
-            } catch (KeeperException.NodeExistsException e) {
-                LOG.warn("trigger already assigned");
-            } catch (UnsupportedEncodingException e) {
-                LOG.error("Error while parsing node data" + e);
-            } catch (Exception e) {
-                LOG.warn("Unable to create node with path - " + EXECUTOR_PATH + "/" + workerId + "/" + jobTrigger.getId());
-            }
         }
     }
 
@@ -280,23 +245,11 @@ public class Master implements Closeable, LeaderSelectorListener {
             final String workerId = selectedWorkerPath.replace(EXECUTOR_PATH + "/", "");
 
             try {
-                final int currentCapacity = BytesUtil.toInt(selectedWorker.getData());
-                LOG.info("Master - capacity -" + currentCapacity);
-                // call back for decrement counter, when complete then call on the parent function of assigning triggers
-                final BackgroundCallback decrementCounterCallback = new BackgroundCallback() {
-                    @Override
-                    public void processResult(CuratorFramework curatorFramework, CuratorEvent curatorEvent) throws Exception {
-                        switch (curatorEvent.getType()) {
-                            // it depends on completion of assign task callback to be completed
-                            case SET_DATA:
-                                assignTriggersToWorkers(triggers, selectionStrategy, index + 1);
-                                break;
-                            default:
-                                LOG.info("Event not handled 0 - " + curatorEvent.getType().name());
-                                break;
-                        }
-                    }
-                };
+                final int currentCapacity = executorCounters.get(selectedWorkerPath).getCount();
+                if (currentCapacity == 0) {
+                    LOG.info("Worker [" + selectedWorkerPath + "] is full capacity [" + currentCapacity + "]");
+                    return;
+                }
 
                 // assign task callback, called when the user is able to create the fired trigger for the given trigger
                 final BackgroundCallback assignTaskCallback = new BackgroundCallback() {
@@ -304,7 +257,8 @@ public class Master implements Closeable, LeaderSelectorListener {
                     public void processResult(CuratorFramework curatorFramework, CuratorEvent curatorEvent) throws Exception {
                         switch (curatorEvent.getType()) {
                             case CREATE:
-                                client.setData().inBackground(decrementCounterCallback).forPath(selectedWorkerPath, BytesUtil.toBytes(currentCapacity - 1));
+                                decrementCounter(selectedWorkerPath);
+                                assignTriggersToWorkers(triggers, selectionStrategy, index + 1);
                                 break;
                             default:
                                 LOG.info("Event not handled 1 - " + curatorEvent.getType().name());
@@ -355,11 +309,31 @@ public class Master implements Closeable, LeaderSelectorListener {
      * decrement the capacity of that worker
      *
      * @param workerPath worker node path
-     * @param capacity capacity of the worker
      * @throws Exception
      */
-    private void decrementCounter(String workerPath, int capacity) throws Exception {
-        client.setData().inBackground().forPath(workerPath, BytesUtil.toBytes(capacity - 1));
+    private void decrementCounter(String workerPath) throws Exception {
+        final MySharedCount counter = executorCounters.get(workerPath);
+        int newCount = counter.getCount() - 1;
+        // keep trying until you hit the right version update on that counter.
+        while (!counter.trySetCount(newCount)) {
+            newCount = counter.getCount() - 1;
+        }
+    }
+
+    /**
+     * initialize the shared counter for that worker to accessed by the master in here
+     *
+     * @param workerPath
+     */
+    private void initCounterForWorker(String workerPath) {
+        // as the counter is already initiated by the worker so it would not matter on setting the initial counter value
+        final MySharedCount sharedCount = new MySharedCount(client, workerPath, 10);
+        executorCounters.put(workerPath, sharedCount);
+        try {
+            sharedCount.start();
+        } catch (Exception e) {
+            LOG.error(e.toString(), e);
+        }
     }
 
     /**

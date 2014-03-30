@@ -2,13 +2,11 @@ package com.emeter.job;
 
 import com.emeter.job.data.JobExecution;
 import com.emeter.job.data.JobTrigger;
-import com.emeter.job.zk.Worker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Date;
 import java.util.Random;
-import java.util.concurrent.*;
 
 /**
  * The Class ${CLASSNAME}
@@ -34,7 +32,7 @@ public class Executor {
         // LOGGER.info("----------------------- Job is executing [" + jobTrigger.getId() + "]---------------------");
         // get a random number of wait milli seconds for which this job would take time to execute
         // this is just to reciprocate the production environment
-        int waitMillis = random.nextInt(1000);
+        int waitMillis = random.nextInt(500);
         JobExecution jobExecution = new JobExecution();
         jobExecution.setStartTime(new Date());
         jobExecution.setTriggerFireTime(jobTrigger.getNextFireTime());

@@ -97,7 +97,7 @@ public class Dispatcher implements Runnable {
             JobTrigger trigger = new JobTrigger();
             Long id = new Long(rand.nextInt(100));
             trigger.setId(id);
-            trigger.setJobDefId(id % 10 + 1);
+            trigger.setJobDefId(id % 10);
             trigger.setNextFireTime(new Date());
             triggers.add(trigger);
         }

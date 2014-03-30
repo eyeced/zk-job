@@ -2,16 +2,17 @@ package com.emeter.job.zk;
 
 import com.emeter.job.Dispatcher;
 import com.emeter.job.Executor;
+import com.emeter.job.common.MySharedCount;
 import com.emeter.job.data.JobExecution;
 import com.emeter.job.data.JobTrigger;
 import com.emeter.job.sample.CustomCompressionProvider;
 import com.emeter.job.util.BytesUtil;
-import org.apache.curator.RetryPolicy;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.api.BackgroundCallback;
 import org.apache.curator.framework.api.CuratorEvent;
 import org.apache.curator.framework.recipes.cache.*;
+import org.apache.curator.framework.recipes.shared.SharedCount;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.zookeeper.CreateMode;
 import org.slf4j.Logger;
@@ -19,7 +20,6 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.io.UnsupportedEncodingException;
 import java.util.Random;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -51,12 +51,20 @@ public class Worker implements Closeable, Runnable {
     private PathChildrenCache assignCache;
 
     /** my personal cache, storing the blocking queue capacity */
-    private NodeCache myCache;
+    // private NodeCache myCache;
 
     /** the god curator framework client. */
     private final CuratorFramework client;
 
-    private final AtomicInteger count = new AtomicInteger(10);
+    /** My counter shared with master. */
+    private final MySharedCount counter;
+
+    private ThreadLocal<AtomicInteger> threadLocal = new ThreadLocal<AtomicInteger>() {
+        @Override
+        protected AtomicInteger initialValue() {
+            return new AtomicInteger(10);
+        }
+    };
 
     /** listener which listens on the different events fired */
     private PathChildrenCacheListener assignCacheListener = new PathChildrenCacheListener() {
@@ -67,15 +75,16 @@ public class Worker implements Closeable, Runnable {
                     // task was assigned to me with job trigger id as its data
                     // LOG.info("Worker - Child added for assignment");
                     final Long jobTriggerId = Long.valueOf(BytesUtil.toString(pathChildrenCacheEvent.getData().getData()));
-                    if (count.intValue() == 0) {
+                    if (threadLocal.get().intValue() == 0) {
+                        LOG.error("Errrrrrrrrrrrr I am busy !!!!!!!!!!");
                         deleteAssignment(jobTriggerId);
                         deleteFiredTrigger(jobTriggerId, jobTriggerId % 10);
-                        Dispatcher.triggerMap.remove(jobTriggerId);
+                        setCounter(threadLocal.get().addAndGet(1));
+                        // Dispatcher.triggerMap.remove(jobTriggerId);
                     } else {
                         // LOG.info("%%%%%%%%%%%%%%%%%%%%%%% Job trigger assigned to me id - " + jobTriggerId);
                         // process the job
                         processJobTrigger(jobTriggerId);
-                        count.set(count.intValue() + 1);
                     }
 
                     break;
@@ -89,14 +98,6 @@ public class Worker implements Closeable, Runnable {
                     LOG.info("Event was fired but not caught - " + pathChildrenCacheEvent.getType().name());
                     break;
             }
-        }
-    };
-
-    /** my node cache listener, listener for any state change on self. */
-    private NodeCacheListener myCacheListener = new NodeCacheListener() {
-        @Override
-        public void nodeChanged() throws Exception {
-            // LOG.info("Node changed --- capacity - " + BytesUtil.toString(myCache.getCurrentData().getData()));
         }
     };
 
@@ -135,7 +136,12 @@ public class Worker implements Closeable, Runnable {
         // initiate the assign cache and listen on this for assignments to this worker
         this.assignCache = new PathChildrenCache(client, this.myPath, true);
         // this is the worker cache, initiate it and listen on it for any changes
-        this.myCache = new NodeCache(client, myPath, true);
+        // this.myCache = new NodeCache(client, myPath, true);
+
+        // initiate the shared counter, which would be shared by master and this worker
+        this.counter = new MySharedCount(client, myPath, 10);
+
+        threadLocal.set(new AtomicInteger(10));
 
         this.blockingQueue = new ArrayBlockingQueue<>(10);
         this.executor = new ThreadPoolExecutor(1, 1,
@@ -186,9 +192,10 @@ public class Worker implements Closeable, Runnable {
     @Override
     public void run() {
         try {
-            myCache.getListenable().addListener(myCacheListener);
-            myCache.start();
+            // myCache.getListenable().addListener(myCacheListener);
+            // myCache.start();
 
+            counter.start();
             closeLatch.await();
         } catch (InterruptedException e) {
             LOG.warn("Worker thread was interrupted " + e);
@@ -199,12 +206,10 @@ public class Worker implements Closeable, Runnable {
 
     /**
      * update the executor capacity
-     *
-     * @param capacity
      */
-    public void updateCapacity(int capacity) {
+    public void setCounter(int newCount) {
         try {
-            client.setData().inBackground().forPath(myPath, BytesUtil.toBytes(capacity));
+            counter.setCount(newCount);
         } catch (Exception e) {
             LOG.error("Some exception came while updating the worker[" + myPath + "] capacity - " + e);
         }
@@ -238,7 +243,7 @@ public class Worker implements Closeable, Runnable {
     @Override
     public void close() throws IOException {
         LOG.info( "Closing" );
-        myCache.close();
+        counter.close();
         assignCache.close();
         client.close();
     }
@@ -250,24 +255,23 @@ public class Worker implements Closeable, Runnable {
      * @param jobTriggerId the trigger id
      */
     public void processJobTrigger(Long jobTriggerId) {
+        threadLocal.get().addAndGet(-1);
         // submit the job for execution and then wait for future to get the result
         Future<JobExecution> future = submitJob(jobTriggerId);
         try {
             // got the completed or failed job execution.
             future.get();
-            LOG.info("Worker " + myPath + " - capacity - " + (10 - executor.getActiveCount()));
-            updateCapacity(10 - assignCache.getCurrentData().size());
+            // LOG.info("Worker " + myPath + " - capacity - " + (10 - executor.getActiveCount()));
+            setCounter(threadLocal.get().addAndGet(1));
 
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        } catch (ExecutionException e) {
-            LOG.error(e.toString());
+        } catch (InterruptedException | ExecutionException e) {
+            LOG.error(e.toString(), e);
         } finally {
             // Step 2 - delete the job trigger id from the worker assignment path
             deleteAssignment(jobTriggerId);
             // Step 3 - delete the fired trigger entry for the job trigger and job def id
             deleteFiredTrigger(jobTriggerId, jobTriggerId % 10);
-            Dispatcher.triggerMap.remove(jobTriggerId);
+            // Dispatcher.triggerMap.remove(jobTriggerId);
         }
     }
 
@@ -302,6 +306,11 @@ public class Worker implements Closeable, Runnable {
                 return jobExecutor.execute(this.trigger);
             }
         }.init(jobTriggerId));
+    }
+
+    private void initCounterForWorker(String workerPath) {
+        SharedCount sharedCount = new SharedCount(client, workerPath, 10);
+
     }
 
     /**

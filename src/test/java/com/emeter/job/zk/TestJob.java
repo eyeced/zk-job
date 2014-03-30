@@ -12,12 +12,12 @@ public class TestJob {
 
     @Test
     public void testJob() {
-        Dispatcher dispatcher = new Dispatcher("server1", "192.168.80.109:2181");
+        Dispatcher dispatcher = new Dispatcher("server1", "localhost:2181");
 
-        Worker worker1 = new Worker("192.168.80.109:2181");
-        Worker worker2 = new Worker("192.168.80.109:2181");
-        Worker worker3 = new Worker("192.168.80.109:2181");
-        Worker worker4 = new Worker("192.168.80.109:2181");
+        Worker worker1 = new Worker("localhost:2181");
+        Worker worker2 = new Worker("localhost:2181");
+        Worker worker3 = new Worker("localhost:2181");
+        Worker worker4 = new Worker("localhost:2181");
 
         try {
             // start the worker zookeeper
@@ -38,11 +38,11 @@ public class TestJob {
             Thread worker1Thread = new Thread(worker1, "worker1");
             worker1Thread.start();
 
-            Thread worker2Thread = new Thread(worker1, "worker2");
+            Thread worker2Thread = new Thread(worker2, "worker2");
             worker2Thread.start();
-            Thread worker3Thread = new Thread(worker1, "worker3");
+            Thread worker3Thread = new Thread(worker3, "worker3");
             worker3Thread.start();
-            Thread worker4Thread = new Thread(worker1, "worker4");
+            Thread worker4Thread = new Thread(worker4, "worker4");
             worker4Thread.start();
 
             dispatcher.startZK();
