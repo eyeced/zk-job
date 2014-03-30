@@ -2,3 +2,4 @@
 zk-job.iml
 ZooKeeper-em-job.iml
 target/
+*.swp
