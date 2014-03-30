@@ -150,6 +150,9 @@ public class Master implements Closeable, LeaderSelectorListener {
         // in fired triggers, when executor gets a job then it will create a fired trigger znode in the
         // group with a unique_identity of {trigger_id}_{job_def_id} and in it we will set the data in it
         client.create().forPath(FIRED_TRIGGERS_PATH, new byte[0]);
+
+        // create the completed group, here workers will update the total number triggers they have executed
+        client.create().forPath("/completed", new byte[0]);
     }
 
     /**

@@ -1,10 +1,13 @@
 var app = require('http').createServer(handler),
-    io = require('socket.io').listen(app),
-    zk_watcher = require('zookeeper-wathcer'),
-    zk = new ZookeeperWatcher({
-      hosts: ['localhost:2181'],
-      root: '/'
-    });
+  fs = require('fs'),
+  io = require('socket.io').listen(app),
+  ZookeeperWatcher = require('zookeeper-watcher'),
+  zk_client = require('node-zookeeper-client').createClient('localhost:2181'),
+  zk = new ZookeeperWatcher({
+    hosts: ['localhost:2181'],
+    root: '/'
+  }),
+  stringify = require('json-stringify-safe');
 
 // creating the server ( localhost:8000 ) 
 app.listen(8000);
@@ -24,13 +27,51 @@ function handler(req, res) {
 
 // creating a new websocket to keep the content updated without any AJAX request
 io.sockets.on('connection', function(socket) {
+  console.log('Socket connected');
   console.log(__dirname);
+
+  zk_client.connect();
   // wait for client to be connected
-  zk.once('connected', function () {
+  zk_client.once('connected', function () {
     console.log('Connected to the server');
-    zk.watch('/completed/worker1', function (err, value, zstat) {
-      console.log(arguments);
-    });
+    listChildren(zk_client, '/completed', socket);
   });
-  
 });
+
+function listChildren(client, path, socket) {
+  client.getChildren(
+    path,
+    function (event) {
+      console.log('Got event: %s', event);
+    },
+    function (err, children, stat) {
+      'use strict';
+      var funcs = [];
+      if (err) {
+        console.log('Failed to get children of %s due to: %s.', path, err);
+        return;
+      }
+      console.log('Children of %s are: %j.', path, children);
+      socket.volatile.emit('children', children);
+      for (var i = 0; i < children.length; i++) {
+        funcs[i] = function (index) {
+          return function () {
+            zk.watch('/completed/' + children[index], function (err, value, zstat) {
+              var child = children[index];
+              console.log(child);
+              var json = {
+                'name': child,
+                'value': value.toString('utf-8')
+              };
+              socket.volatile.emit('notification', json);
+            });
+          };
+        }(i);
+      }
+
+      for (var j = 0; j < children.length; j++) {
+        funcs[j]();
+      }
+    }
+  );
+}

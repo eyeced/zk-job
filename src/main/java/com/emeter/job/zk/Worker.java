@@ -11,8 +11,9 @@ import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.api.BackgroundCallback;
 import org.apache.curator.framework.api.CuratorEvent;
-import org.apache.curator.framework.recipes.cache.*;
-import org.apache.curator.framework.recipes.shared.SharedCount;
+import org.apache.curator.framework.recipes.cache.PathChildrenCache;
+import org.apache.curator.framework.recipes.cache.PathChildrenCacheEvent;
+import org.apache.curator.framework.recipes.cache.PathChildrenCacheListener;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.zookeeper.CreateMode;
 import org.slf4j.Logger;
@@ -59,10 +60,22 @@ public class Worker implements Closeable, Runnable {
     /** My counter shared with master. */
     private final MySharedCount counter;
 
+    /** update the completed counter on zk. */
+    private final MySharedCount completedCounter;
+
+    /** this manages the counter for every worker's capacity, decreased when a trigger is picked and increases after the work is done */
     private ThreadLocal<AtomicInteger> threadLocal = new ThreadLocal<AtomicInteger>() {
         @Override
         protected AtomicInteger initialValue() {
             return new AtomicInteger(10);
+        }
+    };
+
+    /** have the completed counter as well, mainly for UI purpose, showing up how many tasks has been completed by the worker.*/
+    private ThreadLocal<AtomicInteger> completedThreadLocal = new ThreadLocal<AtomicInteger>() {
+        @Override
+        protected AtomicInteger initialValue() {
+            return new AtomicInteger(0);
         }
     };
 
@@ -79,10 +92,9 @@ public class Worker implements Closeable, Runnable {
                         LOG.error("Errrrrrrrrrrrr I am busy !!!!!!!!!!");
                         deleteAssignment(jobTriggerId);
                         deleteFiredTrigger(jobTriggerId, jobTriggerId % 10);
-                        setCounter(threadLocal.get().addAndGet(1));
+                        setCounter(counter, threadLocal.get().addAndGet(1));
                         // Dispatcher.triggerMap.remove(jobTriggerId);
                     } else {
-                        // LOG.info("%%%%%%%%%%%%%%%%%%%%%%% Job trigger assigned to me id - " + jobTriggerId);
                         // process the job
                         processJobTrigger(jobTriggerId);
                     }
@@ -141,6 +153,9 @@ public class Worker implements Closeable, Runnable {
         // initiate the shared counter, which would be shared by master and this worker
         this.counter = new MySharedCount(client, myPath, 10);
 
+        // initiate the completed counter, this would increase the counter of the total completed jobs by this server.
+        this.completedCounter = new MySharedCount(client, "/completed/" + workerId, 0);
+
         threadLocal.set(new AtomicInteger(10));
 
         this.blockingQueue = new ArrayBlockingQueue<>(10);
@@ -196,6 +211,7 @@ public class Worker implements Closeable, Runnable {
             // myCache.start();
 
             counter.start();
+            completedCounter.start();
             closeLatch.await();
         } catch (InterruptedException e) {
             LOG.warn("Worker thread was interrupted " + e);
@@ -207,7 +223,7 @@ public class Worker implements Closeable, Runnable {
     /**
      * update the executor capacity
      */
-    public void setCounter(int newCount) {
+    public void setCounter(MySharedCount counter, int newCount) {
         try {
             counter.setCount(newCount);
         } catch (Exception e) {
@@ -262,8 +278,7 @@ public class Worker implements Closeable, Runnable {
             // got the completed or failed job execution.
             future.get();
             // LOG.info("Worker " + myPath + " - capacity - " + (10 - executor.getActiveCount()));
-            setCounter(threadLocal.get().addAndGet(1));
-
+            setCounter(counter, threadLocal.get().addAndGet(1));
         } catch (InterruptedException | ExecutionException e) {
             LOG.error(e.toString(), e);
         } finally {
@@ -272,6 +287,7 @@ public class Worker implements Closeable, Runnable {
             // Step 3 - delete the fired trigger entry for the job trigger and job def id
             deleteFiredTrigger(jobTriggerId, jobTriggerId % 10);
             // Dispatcher.triggerMap.remove(jobTriggerId);
+            setCounter(completedCounter, completedThreadLocal.get().addAndGet(1));
         }
     }
 
@@ -306,11 +322,6 @@ public class Worker implements Closeable, Runnable {
                 return jobExecutor.execute(this.trigger);
             }
         }.init(jobTriggerId));
-    }
-
-    private void initCounterForWorker(String workerPath) {
-        SharedCount sharedCount = new SharedCount(client, workerPath, 10);
-
     }
 
     /**
